@@ -1,0 +1,354 @@
+library(tidyverse)
+library(plotly)
+library(leaflet)
+library(sf)
+library(viridis)
+library(scales)
+
+source(here::here("R/utils.R"))
+
+create_choropleth_map <- function(geo_data, metric = "total_finance") {
+  message("Creating interactive choropleth map...")
+
+  pal <- colorNumeric(
+    palette = "YlOrRd",
+    domain = geo_data[[metric]],
+    na.color = "#808080"
+  )
+
+  labels <- sprintf(
+    "<strong>%s</strong><br/>Finance: %s<br/>Category: %s",
+    geo_data$name,
+    format_billions(geo_data[[metric]]),
+    geo_data$finance_category
+  ) %>% lapply(htmltools::HTML)
+
+  map <- leaflet(geo_data) %>%
+    addProviderTiles("CartoDB.Positron") %>%
+    addPolygons(
+      fillColor = ~pal(get(metric)),
+      weight = 1,
+      opacity = 1,
+      color = "white",
+      fillOpacity = 0.7,
+      highlight = highlightOptions(
+        weight = 2,
+        color = "#666",
+        fillOpacity = 0.9,
+        bringToFront = TRUE
+      ),
+      label = labels,
+      labelOptions = labelOptions(
+        style = list("font-weight" = "normal", padding = "3px 8px"),
+        textsize = "12px",
+        direction = "auto"
+      )
+    ) %>%
+    addLegend(
+      pal = pal,
+      values = ~get(metric),
+      opacity = 0.7,
+      title = "Climate Finance<br>(Billions USD)",
+      position = "bottomright"
+    ) %>%
+    addControl(
+      html = "<h4>Global Climate Finance Flows</h4>",
+      position = "topleft"
+    )
+
+  return(map)
+}
+
+create_flow_arrows_map <- function(flow_matrix, geo_coords) {
+  message("Creating finance flow arrows map...")
+
+  top_flows <- flow_matrix %>%
+    group_by(source_country, destination_country) %>%
+    summarise(total_flow = sum(flow_amount, na.rm = TRUE), .groups = "drop") %>%
+    top_n(20, total_flow) %>%
+    left_join(geo_coords %>% rename(source_country = country_code, source_lat = lat, source_lon = lon), by = "source_country") %>%
+    left_join(geo_coords %>% rename(destination_country = country_code, dest_lat = lat, dest_lon = lon), by = "destination_country")
+
+  flow_map <- leaflet() %>%
+    addProviderTiles("CartoDB.DarkMatter") %>%
+    addPolylines(
+      data = top_flows,
+      lng = ~c(source_lon, dest_lon),
+      lat = ~c(source_lat, dest_lat),
+      weight = ~sqrt(total_flow),
+      color = "#4CAF50",
+      opacity = 0.6,
+      popup = ~paste("From:", source_country, "<br>To:", destination_country,
+                    "<br>Amount:", format_billions(total_flow))
+    )
+
+  for(i in 1:nrow(geo_coords)) {
+    flow_map <- flow_map %>%
+      addCircleMarkers(
+        lng = geo_coords$lon[i],
+        lat = geo_coords$lat[i],
+        radius = 5,
+        color = "#2196F3",
+        fillOpacity = 0.8,
+        popup = geo_coords$country_code[i]
+      )
+  }
+
+  flow_map <- flow_map %>%
+    addControl(
+      html = "<h4 style='color:white'>International Climate Finance Flows</h4>",
+      position = "topleft"
+    )
+
+  return(flow_map)
+}
+
+create_stacked_bar_chart <- function(instrument_data) {
+  message("Creating interactive stacked bar chart...")
+
+  plot_data <- instrument_data$by_year %>%
+    group_by(year, instrument) %>%
+    summarise(total = sum(amount, na.rm = TRUE), .groups = "drop")
+
+  p <- plot_ly(
+    data = plot_data,
+    x = ~year,
+    y = ~total,
+    color = ~instrument,
+    type = "bar",
+    colors = get_color_palette(4, "categorical"),
+    text = ~paste("Instrument:", instrument, "<br>Amount:", format_billions(total)),
+    hovertemplate = "%{text}<extra></extra>"
+  ) %>%
+    layout(
+      title = list(text = "Climate Finance by Instrument Type", font = list(size = 18)),
+      xaxis = list(title = "Year", tickmode = "linear"),
+      yaxis = list(title = "Amount (Billions USD)"),
+      barmode = "stack",
+      legend = list(title = list(text = "Instrument")),
+      hovermode = "x unified",
+      plot_bgcolor = "#f5f5f5",
+      paper_bgcolor = "white"
+    )
+
+  return(p)
+}
+
+create_instrument_sunburst <- function(cpi_data) {
+  message("Creating instrument sunburst chart...")
+
+  sunburst_data <- cpi_data %>%
+    group_by(finance_type, instrument, sector) %>%
+    summarise(value = sum(amount_usd_billions, na.rm = TRUE), .groups = "drop") %>%
+    mutate(
+      parent_1 = finance_type,
+      parent_2 = paste(finance_type, instrument, sep = " - ")
+    )
+
+  labels <- c(
+    "Total",
+    unique(sunburst_data$parent_1),
+    unique(sunburst_data$parent_2),
+    paste(sunburst_data$parent_2, sunburst_data$sector, sep = " - ")
+  )
+
+  parents <- c(
+    "",
+    rep("Total", length(unique(sunburst_data$parent_1))),
+    sapply(unique(sunburst_data$parent_2), function(x) strsplit(x, " - ")[[1]][1]),
+    sunburst_data$parent_2
+  )
+
+  values <- c(
+    sum(sunburst_data$value),
+    tapply(sunburst_data$value, sunburst_data$parent_1, sum),
+    tapply(sunburst_data$value, sunburst_data$parent_2, sum),
+    sunburst_data$value
+  )
+
+  p <- plot_ly(
+    labels = labels,
+    parents = parents,
+    values = values,
+    type = "sunburst",
+    branchvalues = "total",
+    hovertemplate = "<b>%{label}</b><br>Amount: $%{value:.1f}B<extra></extra>",
+    marker = list(colors = get_color_palette(length(labels), "sequential"))
+  ) %>%
+    layout(
+      title = "Hierarchical View of Climate Finance",
+      margin = list(l = 0, r = 0, b = 0, t = 40)
+    )
+
+  return(p)
+}
+
+create_policy_timeline <- function(policy_data, finance_ts) {
+  message("Creating interactive policy timeline...")
+
+  policy_events <- policy_data %>%
+    mutate(
+      y_position = row_number() %% 3 * 20,
+      color = case_when(
+        category == "Agreement" ~ "#4CAF50",
+        category == "Policy" ~ "#2196F3",
+        category == "Summit" ~ "#FF9800",
+        category == "Finance" ~ "#9C27B0",
+        TRUE ~ "#757575"
+      )
+    )
+
+  finance_trend <- plot_ly(
+    data = finance_ts %>% filter(metric == "cpi_total"),
+    x = ~as.Date(paste0(year, "-01-01")),
+    y = ~value,
+    type = "scatter",
+    mode = "lines+markers",
+    name = "Total Climate Finance",
+    line = list(color = "#4CAF50", width = 3),
+    marker = list(size = 8, color = "#4CAF50")
+  )
+
+  for(i in 1:nrow(policy_events)) {
+    finance_trend <- finance_trend %>%
+      add_trace(
+        x = policy_events$date[i],
+        y = max(finance_ts$value) * (0.7 + i * 0.02),
+        type = "scatter",
+        mode = "markers+text",
+        marker = list(
+          size = 15,
+          color = policy_events$color[i],
+          symbol = "diamond"
+        ),
+        text = policy_events$event[i],
+        textposition = "top center",
+        textfont = list(size = 10),
+        hovertemplate = paste(
+          "<b>", policy_events$event[i], "</b><br>",
+          "Date: ", policy_events$date[i], "<br>",
+          "Category: ", policy_events$category[i], "<br>",
+          "Description: ", policy_events$description[i],
+          "<extra></extra>"
+        ),
+        showlegend = FALSE
+      )
+  }
+
+  finance_trend <- finance_trend %>%
+    layout(
+      title = "Climate Policy Timeline & Finance Trends",
+      xaxis = list(
+        title = "Date",
+        rangeslider = list(type = "date"),
+        type = "date"
+      ),
+      yaxis = list(title = "Climate Finance (Billions USD)"),
+      hovermode = "x unified",
+      annotations = list(
+        list(
+          x = 0.5,
+          y = 1.1,
+          xref = "paper",
+          yref = "paper",
+          text = "Major policy events shown as diamonds",
+          showarrow = FALSE,
+          font = list(size = 12, color = "#666")
+        )
+      )
+    )
+
+  return(finance_trend)
+}
+
+create_comparative_chart <- function(time_series_data) {
+  message("Creating comparative metrics chart...")
+
+  normalized_data <- time_series_data %>%
+    group_by(metric) %>%
+    mutate(normalized_value = normalize_values(value, "minmax") * 100) %>%
+    ungroup()
+
+  p <- plot_ly() %>%
+    add_trace(
+      data = normalized_data %>% filter(metric == "cpi_total"),
+      x = ~year,
+      y = ~normalized_value,
+      type = "scatter",
+      mode = "lines+markers",
+      name = "Total Climate Finance",
+      line = list(color = "#4CAF50", width = 2)
+    ) %>%
+    add_trace(
+      data = normalized_data %>% filter(metric == "renewable_investment"),
+      x = ~year,
+      y = ~normalized_value,
+      type = "scatter",
+      mode = "lines+markers",
+      name = "Renewable Investment",
+      line = list(color = "#2196F3", width = 2)
+    ) %>%
+    add_trace(
+      data = normalized_data %>% filter(metric == "capacity_added"),
+      x = ~year,
+      y = ~normalized_value,
+      type = "scatter",
+      mode = "lines+markers",
+      name = "Capacity Added",
+      line = list(color = "#FF9800", width = 2)
+    ) %>%
+    layout(
+      title = "Comparative Climate Finance Metrics (Normalized)",
+      xaxis = list(title = "Year"),
+      yaxis = list(title = "Normalized Value (0-100)"),
+      legend = list(x = 0.02, y = 0.98),
+      hovermode = "x unified"
+    )
+
+  return(p)
+}
+
+generate_all_visualizations <- function(data_file = "data/processed/processed_climate_finance.rds") {
+  message("Generating all visualizations...\n")
+
+  if (!file.exists(data_file)) {
+    stop("Processed data not found. Please run data_processing.R first.")
+  }
+
+  data <- readRDS(data_file)
+
+  viz_list <- list()
+
+  viz_list$choropleth <- create_choropleth_map(data$geo)
+  message("✓ Choropleth map created\n")
+
+  coords <- get_country_coords()
+  viz_list$flow_map <- create_flow_arrows_map(data$flows$matrix, coords)
+  message("✓ Flow arrows map created\n")
+
+  viz_list$stacked_bar <- create_stacked_bar_chart(data$instruments)
+  message("✓ Stacked bar chart created\n")
+
+  if (exists("all_data") && !is.null(all_data$cpi)) {
+    viz_list$sunburst <- create_instrument_sunburst(all_data$cpi)
+  }
+  message("✓ Sunburst chart created\n")
+
+  viz_list$timeline <- create_policy_timeline(data$policies, data$time_series)
+  message("✓ Policy timeline created\n")
+
+  viz_list$comparative <- create_comparative_chart(data$time_series)
+  message("✓ Comparative chart created\n")
+
+  saveRDS(viz_list, "data/processed/visualizations.rds")
+  message("\n✓ All visualizations generated and saved!")
+  message("  Output: data/processed/visualizations.rds")
+  message("\nNext step: Run the Shiny app with 'shiny::runApp(\"app\")'")
+
+  return(viz_list)
+}
+
+if (sys.nframe() == 0) {
+  visualizations <- generate_all_visualizations()
+  message("\nVisualizations complete! Ready for Shiny dashboard integration.")
+}
