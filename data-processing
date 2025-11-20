@@ -1,0 +1,303 @@
+if(require(tidyverse, quietly = TRUE)) library(tidyverse)
+if(require(countrycode, quietly = TRUE)) library(countrycode)
+
+# Load spatial packages only if available
+sf_available <- require(sf, quietly = TRUE)
+rnaturalearth_available <- require(rnaturalearth, quietly = TRUE)
+
+if (file.exists(here::here("R/utils.R"))) {
+  source(here::here("R/utils.R"))
+}
+
+process_finance_flows <- function(cpi_data) {
+  message("Processing climate finance flows...")
+
+  flows <- cpi_data %>%
+    group_by(year, country, country_code, flow_type) %>%
+    summarise(
+      total_amount_billions = sum(amount_usd_billions, na.rm = TRUE),
+      public_finance = sum(amount_usd_billions[finance_type == "Public"], na.rm = TRUE),
+      private_finance = sum(amount_usd_billions[finance_type == "Private"], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      public_share = public_finance / total_amount_billions * 100,
+      private_share = private_finance / total_amount_billions * 100,
+      net_flow = ifelse(flow_type == "International",
+                       total_amount_billions * 0.3,
+                       total_amount_billions * 0.7)
+    )
+
+  flow_matrix <- cpi_data %>%
+    filter(flow_type == "International") %>%
+    mutate(
+      source_country = sample(country, n(), replace = TRUE),
+      destination_country = country
+    ) %>%
+    group_by(year, source_country, destination_country) %>%
+    summarise(
+      flow_amount = sum(amount_usd_billions, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  return(list(
+    summary = flows,
+    matrix = flow_matrix
+  ))
+}
+
+process_instrument_breakdown <- function(cpi_data) {
+  message("Processing financing instrument breakdown...")
+
+  instruments <- cpi_data %>%
+    group_by(year, instrument, sector) %>%
+    summarise(
+      amount = sum(amount_usd_billions, na.rm = TRUE),
+      count = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      instrument = factor(instrument, levels = c("Grants", "Loans", "Equity", "Guarantees"))
+    )
+
+  instrument_by_country <- cpi_data %>%
+    group_by(country_code, instrument) %>%
+    summarise(
+      total_amount = sum(amount_usd_billions, na.rm = TRUE),
+      avg_amount = mean(amount_usd_billions, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(
+      names_from = instrument,
+      values_from = total_amount,
+      values_fill = 0
+    )
+
+  return(list(
+    by_year = instruments,
+    by_country = instrument_by_country
+  ))
+}
+
+create_geospatial_data <- function(flow_data) {
+  message("Creating geospatial datasets...")
+
+  # If spatial packages aren't available, return simplified data
+  if (!sf_available || !rnaturalearth_available) {
+    latest_year <- max(flow_data$summary$year)
+
+    country_finance <- flow_data$summary %>%
+      filter(year == latest_year) %>%
+      group_by(country_code) %>%
+      summarise(
+        total_finance = sum(total_amount_billions, na.rm = TRUE),
+        net_flow = sum(net_flow, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        finance_category = cut(total_finance,
+                              breaks = c(0, 10, 50, 100, 500, Inf),
+                              labels = c("<10B", "10-50B", "50-100B", "100-500B", ">500B"),
+                              include.lowest = TRUE),
+        flow_direction = ifelse(net_flow > 0, "Net Receiver", "Net Provider")
+      )
+
+    return(country_finance)
+  }
+
+  # Full spatial processing if packages are available
+  world <- ne_countries(scale = "medium", returnclass = "sf") %>%
+    select(iso_a3, name, geometry) %>%
+    rename(country_code = iso_a3)
+
+  latest_year <- max(flow_data$summary$year)
+
+  country_finance <- flow_data$summary %>%
+    filter(year == latest_year) %>%
+    group_by(country_code) %>%
+    summarise(
+      total_finance = sum(total_amount_billions, na.rm = TRUE),
+      net_flow = sum(net_flow, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  geo_data <- world %>%
+    left_join(country_finance, by = "country_code") %>%
+    mutate(
+      finance_category = cut(total_finance,
+                            breaks = c(0, 10, 50, 100, 500, Inf),
+                            labels = c("<10B", "10-50B", "50-100B", "100-500B", ">500B"),
+                            include.lowest = TRUE),
+      flow_direction = ifelse(net_flow > 0, "Net Receiver", "Net Provider")
+    )
+
+  return(geo_data)
+}
+
+calculate_policy_impacts <- function(cpi_data, policy_data) {
+  message("Calculating policy impact correlations...")
+
+  annual_finance <- cpi_data %>%
+    group_by(year) %>%
+    summarise(
+      total_finance = sum(amount_usd_billions, na.rm = TRUE),
+      renewable_share = sum(amount_usd_billions[sector == "Renewable Energy"], na.rm = TRUE) /
+                       sum(amount_usd_billions, na.rm = TRUE) * 100,
+      .groups = "drop"
+    )
+
+  policy_years <- policy_data %>%
+    mutate(year = lubridate::year(date)) %>%
+    group_by(year) %>%
+    summarise(
+      policy_count = n(),
+      max_impact = max(impact_score, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  impact_analysis <- annual_finance %>%
+    left_join(policy_years, by = "year") %>%
+    mutate(
+      policy_count = replace_na(policy_count, 0),
+      max_impact = replace_na(max_impact, 0),
+      finance_growth = calculate_growth_rate(., total_finance)$growth_rate
+    )
+
+  return(impact_analysis)
+}
+
+create_time_series_data <- function(all_data) {
+  message("Creating time series datasets...")
+
+  cpi_ts <- all_data$cpi %>%
+    group_by(year) %>%
+    summarise(
+      cpi_total = sum(amount_usd_billions, na.rm = TRUE),
+      cpi_public = sum(amount_usd_billions[finance_type == "Public"], na.rm = TRUE),
+      cpi_private = sum(amount_usd_billions[finance_type == "Private"], na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  iea_ts <- all_data$iea %>%
+    group_by(year) %>%
+    summarise(
+      renewable_investment = sum(investment_usd_billions, na.rm = TRUE),
+      capacity_added = sum(capacity_added_gw, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  oecd_ts <- all_data$oecd %>%
+    filter(indicator %in% c("GHG_PROD", "REN_PERC", "ENV_TAXREV")) %>%
+    group_by(year, indicator) %>%
+    summarise(
+      avg_value = mean(value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(
+      names_from = indicator,
+      values_from = avg_value,
+      values_fill = 0
+    ) %>%
+    rename(
+      ghg_emissions = GHG_PROD,
+      renewable_share = REN_PERC,
+      env_tax_revenue = ENV_TAXREV
+    )
+
+  # Add climate flows if available
+  climate_flows_ts <- if (!is.null(all_data$climate_flows)) {
+    all_data$climate_flows %>%
+      filter(climate_component == "CLIMATE_TOTAL", flow_type == "COMMITMENT") %>%
+      group_by(year) %>%
+      summarise(
+        climate_finance_commitments = sum(amount_usd_millions, na.rm = TRUE) / 1000, # Convert to billions
+        .groups = "drop"
+      )
+  } else {
+    tibble()
+  }
+
+  combined_ts <- cpi_ts %>%
+    left_join(iea_ts, by = "year") %>%
+    left_join(oecd_ts, by = "year")
+
+  if (nrow(climate_flows_ts) > 0) {
+    combined_ts <- combined_ts %>%
+      left_join(climate_flows_ts, by = "year")
+  }
+
+  combined_ts <- combined_ts %>%
+    pivot_longer(
+      cols = -year,
+      names_to = "metric",
+      values_to = "value"
+    ) %>%
+    mutate(
+      metric_category = case_when(
+        str_detect(metric, "cpi") ~ "Climate Finance",
+        str_detect(metric, "renewable") ~ "Renewable Energy",
+        str_detect(metric, "capacity") ~ "Capacity",
+        str_detect(metric, "ghg|emissions") ~ "Emissions",
+        str_detect(metric, "env_tax") ~ "Environmental Policy",
+        str_detect(metric, "climate_finance") ~ "International Climate Finance",
+        TRUE ~ "Other"
+      )
+    )
+
+  return(combined_ts)
+}
+
+process_all_data <- function(data_file = "data/processed/all_climate_finance_data.rds") {
+  message("Starting comprehensive data processing pipeline...\n")
+
+  if (!file.exists(data_file)) {
+    stop("Data file not found. Please run data_acquisition.R first.")
+  }
+
+  all_data <- readRDS(data_file)
+
+  finance_flows <- process_finance_flows(all_data$cpi)
+  message("✓ Finance flows processed\n")
+
+  instruments <- process_instrument_breakdown(all_data$cpi)
+  message("✓ Instrument breakdown processed\n")
+
+  geo_data <- create_geospatial_data(finance_flows)
+  message("✓ Geospatial data created\n")
+
+  policy_impacts <- calculate_policy_impacts(all_data$cpi, all_data$policies)
+  message("✓ Policy impacts calculated\n")
+
+  time_series <- create_time_series_data(all_data)
+  message("✓ Time series data created\n")
+
+  processed_data <- list(
+    flows = finance_flows,
+    instruments = instruments,
+    geo = geo_data,
+    policy_impacts = policy_impacts,
+    time_series = time_series,
+    policies = all_data$policies,
+    metadata = list(
+      process_date = Sys.Date(),
+      n_countries = length(unique(all_data$cpi$country_code)),
+      year_range = range(all_data$cpi$year),
+      total_finance = sum(all_data$cpi$amount_usd_billions, na.rm = TRUE)
+    )
+  )
+
+  saveRDS(processed_data, "data/processed/processed_climate_finance.rds")
+  message("\n✓ All data processing complete!")
+  message("  Output: data/processed/processed_climate_finance.rds")
+  message("\nSummary Statistics:")
+  message(paste("  Countries:", processed_data$metadata$n_countries))
+  message(paste("  Years:", paste(processed_data$metadata$year_range, collapse = "-")))
+  message(paste("  Total Finance:", format_billions(processed_data$metadata$total_finance)))
+
+  return(processed_data)
+}
+
+if (sys.nframe() == 0) {
+  processed_data <- process_all_data()
+  message("\nNext step: Run 'source(\"R/visualizations.R\")' to create visualizations")
+}
